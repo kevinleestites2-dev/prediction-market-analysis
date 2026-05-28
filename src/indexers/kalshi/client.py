@@ -1,7 +1,13 @@
 from collections.abc import Generator
 from typing import Optional
+import base64
+import os
+import time
+from pathlib import Path
 
 import httpx
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
 
 from src.common.client import retry_request
 from src.indexers.kalshi.models import Market, Trade
@@ -9,10 +15,52 @@ from src.indexers.kalshi.models import Market, Trade
 KALSHI_API_HOST = "https://api.elections.kalshi.com/trade-api/v2"
 
 
+def _load_private_key(key_path: str):
+    """Load RSA private key from PEM file."""
+    with open(key_path, "rb") as f:
+        return serialization.load_pem_private_key(f.read(), password=None)
+
+
+def _sign_request(private_key, method: str, path: str, ts_ms: int) -> str:
+    """Generate RSA-SHA256 signature for Kalshi API auth."""
+    msg = f"{ts_ms}{method.upper()}{path}"
+    sig = private_key.sign(msg.encode(), padding.PKCS1v15(), hashes.SHA256())
+    return base64.b64encode(sig).decode()
+
+
 class KalshiClient:
-    def __init__(self, host: str = KALSHI_API_HOST):
+    def __init__(
+        self,
+        host: str = KALSHI_API_HOST,
+        api_key_id: Optional[str] = None,
+        private_key_path: Optional[str] = None,
+    ):
         self.host = host
+
+        # Auth — read from env or explicit args
+        self.api_key_id = api_key_id or os.environ.get("KALSHI_API_KEY_ID", "")
+        _key_path = private_key_path or os.environ.get("KALSHI_PRIVATE_KEY_PATH", "")
+
+        self._private_key = None
+        if self.api_key_id and _key_path and Path(_key_path).exists():
+            self._private_key = _load_private_key(_key_path)
+            print(f"[KalshiClient] Authenticated as {self.api_key_id}")
+        else:
+            print("[KalshiClient] No credentials found — using public (unauthenticated) access")
+
         self.client = httpx.Client(base_url=host, timeout=30.0)
+
+    def _auth_headers(self, method: str, path: str) -> dict:
+        """Build RSA auth headers if credentials are available."""
+        if not self._private_key or not self.api_key_id:
+            return {}
+        ts_ms = int(time.time() * 1000)
+        sig = _sign_request(self._private_key, method, path, ts_ms)
+        return {
+            "KALSHI-ACCESS-KEY": self.api_key_id,
+            "KALSHI-ACCESS-SIGNATURE": sig,
+            "KALSHI-ACCESS-TIMESTAMP": str(ts_ms),
+        }
 
     def __enter__(self):
         return self
@@ -26,7 +74,8 @@ class KalshiClient:
     @retry_request()
     def _get(self, path: str, params: Optional[dict] = None) -> dict:
         """Make a GET request with retry/backoff."""
-        response = self.client.get(path, params=params)
+        headers = self._auth_headers("GET", path)
+        response = self.client.get(path, params=params, headers=headers)
         response.raise_for_status()
         return response.json()
 
